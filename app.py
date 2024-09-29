@@ -3,6 +3,9 @@ import pandas as pd
 import folium
 from folium.plugins import TimestampedGeoJson, HeatMap
 import plotly.express as px
+from datetime import datetime
+from pandas.tseries.offsets import DateOffset
+import statsmodels.api as sm
 
 app = Flask(__name__)
 
@@ -64,6 +67,37 @@ def suggest_policies(location, data):
     
     return policies
 
+# SARIMA forecasting function
+def forecast_sarima(location_data):
+    mintemp_model = sm.tsa.statespace.SARIMAX(location_data['MinTemp'], order=(1, 0, 1), seasonal_order=(1, 1, 0, 52))
+    maxtemp_model = sm.tsa.statespace.SARIMAX(location_data['MaxTemp'], order=(1, 0, 1), seasonal_order=(1, 1, 1, 52))
+    rainfall_model = sm.tsa.statespace.SARIMAX(location_data['Rainfall'], order=(0, 0, 0), seasonal_order=(1, 1, 1, 52))
+
+    # Fit models
+    mintemp_model_fit = mintemp_model.fit(disp=False)
+    maxtemp_model_fit = maxtemp_model.fit(disp=False)
+    rainfall_model_fit = rainfall_model.fit(disp=False)
+
+    # Generate future dates (26 weeks from the last date in the data)
+    future_dates = [location_data.index[-1] + DateOffset(weeks=x) for x in range(1, 27)]
+
+    # Forecast the next 26 weeks for each variable
+    mintemp_forecast = mintemp_model_fit.forecast(steps=26)
+    maxtemp_forecast = maxtemp_model_fit.forecast(steps=26)
+    rainfall_forecast = rainfall_model_fit.forecast(steps=26)
+
+    # Create a DataFrame for the forecasts
+    forecast_df = pd.DataFrame({
+        'Date': future_dates,
+        'MinTemp_Forecast': mintemp_forecast,
+        'MaxTemp_Forecast': maxtemp_forecast,
+        'Rainfall_Forecast': rainfall_forecast
+    })
+    forecast_df.set_index('Date', inplace=True)
+    
+    return forecast_df
+
+
 # Home route
 @app.route('/')
 def home():
@@ -89,6 +123,30 @@ def search():
     else:
         return jsonify({'error': 'Location not found'})
 
+# Forecast route
+@app.route('/forecast', methods=['GET'])
+def forecast():
+    location = request.args.get('location')
+    location_data = df[df['Location'].str.contains(location, case=False, na=False)]
+    
+    if not location_data.empty:
+        # Convert the 'Date' column to datetime and set as index
+        location_data['Date'] = pd.to_datetime(location_data['Date'])
+        location_data.set_index('Date', inplace=True)
+
+        # Resample and interpolate as per your original logic
+        location_data = location_data.resample('W').mean().interpolate(method='linear')
+
+        # Perform SARIMA forecasting
+        forecast_df = forecast_sarima(location_data)
+
+        # Convert forecast_df to JSON format for easy consumption
+        forecast_json = forecast_df.reset_index().to_json(orient='records', date_format='iso')
+
+        return jsonify(forecast_json)
+    else:
+        return jsonify({'error': 'Location not found'})
+    
 # GIS Map route
 @app.route('/map')
 def map_view():
@@ -133,179 +191,37 @@ def temporal_map():
                 'type': 'Feature',
                 'geometry': {
                     'type': 'Point',
-                    'coordinates': [151.2099, -33.865143]
+                    'coordinates': [151.209900, -33.865143]  # Sydney
                 },
                 'properties': {
-                    'time': '2023-09-23T00:00:00Z',
-                    'popup': 'Sydney Temperature Data'
+                    'time': '2023-09-29',
+                    'location': 'Sydney'
                 }
             },
             {
                 'type': 'Feature',
                 'geometry': {
                     'type': 'Point',
-                    'coordinates': [144.963058, -37.813629]
+                    'coordinates': [144.963058, -37.813629]  # Melbourne
                 },
                 'properties': {
-                    'time': '2023-09-24T00:00:00Z',
-                    'popup': 'Melbourne Temperature Data'
+                    'time': '2023-09-29',
+                    'location': 'Melbourne'
                 }
-            }
+            },
+            # Add more locations as needed
         ]
     }
 
-    m = folium.Map(location=[-33.865143, 151.209900], zoom_start=4)
-    TimestampedGeoJson(
-        data,
-        period='P1D',  # daily data
-        add_last_point=True,
-        auto_play=True,
-        loop=True
-    ).add_to(m)
+    # Create a base map
+    m = folium.Map(location=[-25.2744, 133.7751], zoom_start=4)
+    
+    # Add timestamped geojson
+    TimestampedGeoJson(data,
+                        period='PT1M',
+                        add_last_point=True).add_to(m)
+
     return m._repr_html_()
-
-# Rainfall chart route
-@app.route('/rainfall_chart')
-def rainfall_chart():
-    location = request.args.get('location')
-    data = df[df['Location'].str.contains(location, case=False, na=False)]
-
-    if not data.empty:
-        # Convert the 'Date' column to datetime
-        data['Date'] = pd.to_datetime(data['Date'])
-        
-        # Sort by date
-        data = data.sort_values('Date')
-
-        # Calculate a 30-day moving average
-        data['Rainfall_MA'] = data['Rainfall'].rolling(window=30).mean()
-
-        # Create a figure
-        fig = px.bar(data, x='Date', y='Rainfall', title=f'Rainfall in {location.upper()}',
-                     labels={'Rainfall': 'Rainfall (mm)', 'Date': 'Date'})
-
-        # Add a line plot for the moving average
-        fig.add_scatter(x=data['Date'], y=data['Rainfall_MA'], mode='lines', name='30-Day Moving Average')
-
-        # Update layout for better visuals
-        fig.update_layout(
-            title={
-                'text': f"Rainfall in {location.upper()}",
-                'x': 0.5,
-                'xanchor': 'center'
-            },
-            xaxis_title='Date',
-            yaxis_title='Rainfall (mm)',
-            template='plotly_white',
-            hovermode='x'
-        )
-
-        # Add annotation for significant events
-        max_rainfall = data['Rainfall'].max()
-        max_date = data[data['Rainfall'] == max_rainfall]['Date'].iloc[0]
-
-        fig.add_annotation(
-            x=max_date,
-            y=max_rainfall,
-            text=f"Highest Rainfall: {max_rainfall} mm",
-            showarrow=True,
-            arrowhead=1
-        )
-
-                # Customize bar colors based on the intensity of rainfall
-        colors = ['#3498db' if val < 50 else '#e74c3c' for val in data['Rainfall']]
-        fig.update_traces(marker=dict(color=colors))
-
-        graph_html = fig.to_html(full_html=False)
-        return render_template('chart.html', graph_html=graph_html)
-    else:
-        return "Location not found"
-
-# Temperature trends route
-@app.route('/temperature_trend')
-def temperature_trend():
-    location = request.args.get('location')
-    data = df[df['Location'].str.contains(location, case=False, na=False)]
-
-    if not data.empty:
-        # Convert the 'Date' column to datetime
-        data['Date'] = pd.to_datetime(data['Date'])
-
-        # Sort by date
-        data = data.sort_values('Date')
-
-        # Create a figure for temperature trends
-        fig = px.line(data, x='Date', y=['MaxTemp', 'MinTemp', 'Temp3pm'],
-                      labels={'value': 'Temperature (°C)', 'Date': 'Date'},
-                      title=f'Temperature Trends in {location.upper()}')
-
-        # Update layout for better visuals
-        fig.update_layout(
-            title={
-                'text': f"Temperature Trends in {location.upper()}",
-                'x': 0.5,
-                'xanchor': 'center'
-            },
-            xaxis_title='Date',
-            yaxis_title='Temperature (°C)',
-            legend_title_text='Temperature Types',
-            template='plotly_white',
-            hovermode='x'
-        )
-
-        graph_html = fig.to_html(full_html=False)
-        return render_template('chart.html', graph_html=graph_html)
-    else:
-        return "Location not found"
-
-# Rainfall distribution histogram route
-@app.route('/rainfall_distribution')
-def rainfall_distribution():
-    location = request.args.get('location')
-    data = df[df['Location'].str.contains(location, case=False, na=False)]
-
-    if not data.empty:
-        # Create a histogram for rainfall distribution
-        fig = px.histogram(data, x='Rainfall', nbins=50,
-                           title=f'Rainfall Distribution in {location.upper()}',
-                           labels={'Rainfall': 'Daily Rainfall (mm)'})
-        
-        # Update layout for better visuals
-        fig.update_layout(
-            xaxis_title='Daily Rainfall (mm)',
-            yaxis_title='Frequency',
-            template='plotly_white'
-        )
-
-        graph_html = fig.to_html(full_html=False)
-        return render_template('chart.html', graph_html=graph_html)
-    else:
-        return "Location not found"
-
-# Correlation matrix route
-@app.route('/correlation_matrix')
-def correlation_matrix():
-    location = request.args.get('location')
-    data = df[df['Location'].str.contains(location, case=False, na=False)]
-
-    if not data.empty:
-        # Calculate the correlation matrix
-        correlation_data = data[['MaxTemp', 'MinTemp', 'Temp3pm', 'Rainfall', 'Humidity3pm', 'Humidity9am']].corr()
-
-        # Create a heatmap for the correlation matrix
-        fig = px.imshow(correlation_data, text_auto=True, title=f'Correlation Matrix in {location.upper()}')
-        
-        # Update layout for better visuals
-        fig.update_layout(
-            xaxis_title='Climate Variables',
-            yaxis_title='Climate Variables',
-            template='plotly_white'
-        )
-
-        graph_html = fig.to_html(full_html=False)
-        return render_template('chart.html', graph_html=graph_html)
-    else:
-        return "Location not found"
 
 if __name__ == '__main__':
     app.run(debug=True)
